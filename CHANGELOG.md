@@ -157,6 +157,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that added it. Docs only.
 
 ### CI
+- **Repository-local issue closure in PRs** — the required `PR title` check
+  rejects direct cross-repository auto-closing keywords, while local
+  `Closes #N` and cross-repository `Refs owner/repo#N` remain valid. The
+  PR body is inert environment data; no checkout or token permissions are
+  needed. The guard is a best-effort line scanner, not a full Markdown parser:
+  fenced, indented and inline code and HTML comments are ignored in one pass,
+  so a comment opener inside a fence cannot hide a later closure, and
+  `Closes: owner/repo#N` is caught too. Fences inside block quotes or list items
+  are not recognized. Regression cases cover longer, mixed and mismatched
+  fences, tab indentation, inline code and unterminated comment openers.
 - **The cookbook verifies the built wheel before it is published
   (cubrid-lab/cubrid-cookbook-python#240)** — `publish-pypi.yml` gains
   `verify-candidate`, which calls the cookbook smoke test in candidate mode on the

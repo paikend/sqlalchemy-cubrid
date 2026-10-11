@@ -6,6 +6,7 @@ name: PR title
 # Security: runs on `pull_request` (never `pull_request_target`), requests no
 # token permissions, checks out nothing and receives the title only through an
 # environment variable, so no PR-controlled code or string is executed.
+# Also rejects accidental foreign-issue closing keywords in inert PR body data.
 # The job name "PR title" is the required-status-check context; keep it stable.
 
 on:
@@ -27,6 +28,7 @@ jobs:
       - name: Check PR title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           python3 - <<'PY'
           # BEGIN pr-title-validator
@@ -93,6 +95,97 @@ jobs:
               errors.append("Do not mark work in progress in the title; open a draft PR.")
           if any(ch.isalpha() and not ch.isascii() for ch in title):
               errors.append("Write the title in English (ASCII letters only).")
+
+
+          # BEGIN cross-repo-closing-guard
+          # No checkout or execution of untrusted PR-body text is needed.
+          def strip_inert_markdown(text: str) -> str:
+              # One pass, so fences, comments and code spans cannot hide each other.
+              output = []
+              fence_char = None
+              fence_size = 0
+              in_comment = False
+              after_blank = True
+              token = re.compile(r"<!--|(?<!\\)\x60+")
+              for line in text.splitlines():
+                  expanded = line.expandtabs(4)
+                  stripped = expanded.lstrip(" ")
+                  indent = len(expanded) - len(stripped)
+                  delimiter = re.match(r"\x60{3,}|~{3,}", stripped) if indent <= 3 else None
+                  if fence_char is not None:
+                      if (
+                          delimiter is not None
+                          and delimiter.group()[0] == fence_char
+                          and len(delimiter.group()) >= fence_size
+                          and not stripped[len(delimiter.group()):].strip()
+                      ):
+                          fence_char = None
+                          after_blank = True
+                      continue
+                  if not in_comment:
+                      if indent >= 4 and after_blank and stripped.strip():
+                          continue  # Indented Markdown code is inert.
+                      if delimiter is not None and not (
+                          stripped[0] == "\x60" and "\x60" in stripped[delimiter.end():]
+                      ):  # A backtick fence's info string cannot contain a backtick.
+                          fence_char, fence_size = delimiter.group()[0], len(delimiter.group())
+                          continue
+                  # Indented code may also follow a blank line or an ATX heading.
+                  heading = re.match(r" {0,3}#{1,6}(?:\s|$)", expanded)
+                  after_blank = not line.strip() or heading is not None
+                  pos = 0
+                  while pos < len(line):
+                      if in_comment:
+                          end = line.find("-->", pos)
+                          if end < 0:
+                              break
+                          in_comment = False
+                          pos = end + 3
+                          continue
+                      found = token.search(line, pos)
+                      if found is None:
+                          output.append(line[pos:])
+                          break
+                      output.append(line[pos:found.start()])
+                      if found.group() == "<!--":
+                          if found.start() == len(line) - len(line.lstrip(" ")) <= 3:
+                              in_comment = True  # A line-start comment block ends at "-->".
+                              pos = found.start() + 2
+                              continue
+                          end = line.find("-->", found.end())
+                          if end < 0:
+                              output.append(found.group())  # Unclosed inline "<!--" is text.
+                              pos = found.end()
+                          else:
+                              pos = end + 3
+                          continue
+                      run = re.escape(found.group())
+                      close = re.compile(rf"(?<!\x60){run}(?!\x60)").search(line, found.end())
+                      if close is None:
+                          output.append(found.group())
+                          pos = found.end()
+                      else:
+                          output.append(" ")  # Inline code is inert.
+                          pos = close.end()
+                  output.append("\n")
+              return "".join(output)
+
+          body = strip_inert_markdown(os.environ.get("PR_BODY", ""))
+          close_ref = re.compile(
+              r"(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved):?\s+"
+              r"(?:https://(?:www\.)?github\.com/)?"
+              r"(?P<owner>[a-z0-9][a-z0-9-]*)/(?P<repo>[a-z0-9_.-]+)"
+              r"(?:#|/issues/)(?P<number>[1-9][0-9]*)\b"
+          )
+          local_repo = os.environ.get("GITHUB_REPOSITORY", "").lower()
+          for match in close_ref.finditer(body):
+              target = f"{match['owner']}/{match['repo']}".lower()
+              if target != local_repo:
+                  errors.append(
+                      f"Cross-repository issue closure {match.group()!r} is forbidden; "
+                      f"use 'Refs {target}#{match['number']}' and let its own repo close it."
+                  )
+          # END cross-repo-closing-guard
 
           for message in warnings:
               print(f"::warning title=PR title::{message}")
