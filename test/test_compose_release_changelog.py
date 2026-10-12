@@ -228,3 +228,33 @@ def test_unclosed_code_fence_fails_closed(base: str, generated: str, message: st
 def test_fenced_release_header_fails_closed(base: str, generated: str) -> None:
     with pytest.raises(ValueError, match="release header inside an open code fence"):
         compose(base, generated, "1.9.0")
+
+
+def test_generated_issue_references_render_as_refs_not_closes() -> None:
+    # release-please renders a "Refs #479" footer as ", closes [#479](...)" (#770).
+    entry = (
+        "* pin note ([#801](https://example/issues/801)) ([ea9392e](https://example/commit/e))"
+        ", closes [cubrid-lab/pycubrid#801](https://example/pycubrid/issues/801)"
+        " [#479](https://example/issues/479)"
+    )
+    curated = (
+        "- Curated ([abc1234](https://example/commit/c)), closes [#9](https://example/issues/9)"
+    )
+    history = "* old ([def5678](https://example/commit/d)), closes [#7](https://example/issues/7)"
+    subject = "* note (x), closes [y] stays"
+    fenced = "```\n* call ([abc1234](https://example/commit/f)), closes [literal]\n```"
+    base = BASE.replace("Keep this **exactly**.", curated).replace("Old history.", history)
+    generated = NOTES.replace("* new API", f"{entry}\n{subject}\n\n{fenced}") + (
+        "\n## [1.8.0](https://example/compare) (2026-09-01)\n\n### Fixed\n\n" + history + "\n"
+    )
+    actual = compose(base, generated, "1.9.0")
+    assert (
+        "([ea9392e](https://example/commit/e)), refs "
+        "[cubrid-lab/pycubrid#801](https://example/pycubrid/issues/801)"
+        " [#479](https://example/issues/479)" in actual
+    )
+    candidate = actual[actual.index("## [1.9.0]") : actual.index("## [1.8.0]")]
+    assert curated in candidate and subject in candidate and fenced in candidate
+    assert candidate.count(", closes [") == 3  # curated line, subject and fenced example
+    assert actual[actual.index("## [1.8.0]") :] == base[base.index("## [1.8.0]") :]
+    assert compose(base, generated, "1.9.0") == actual

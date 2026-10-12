@@ -5,7 +5,8 @@ Read main's CHANGELOG at the generator base SHA, never a previously composed
 candidate. Generated headers belong in RELEASE_CHANGELOG.md; publication keeps
 its strict bracket/date contract. Curated and generated entries are merged under
 the standard ``###`` headings in the standard order, so the candidate passes
-scripts/lint_changelog.py. Call only after the freeze-label check.
+scripts/lint_changelog.py. Generated issue references are rendered as "refs",
+not "closes" (see GENERATED_REFERENCES). Call only after the freeze-label check.
 """
 
 from __future__ import annotations
@@ -42,6 +43,12 @@ ALLOWED_SECTIONS = (
     "Tests",
 )
 GENERATED_ALIASES = {"⚠ BREAKING CHANGES": "Upgrade notes"}
+# release-please 17.6.0 turns an issue trailer in a commit's final footer
+# block ("Refs #1" as well as "Closes #1") into a reference, and its
+# changelog template renders all references as ", closes [#1](...)". The
+# keyword is lost, so "closes" can be false; "refs" is true for every trailer.
+# The match is tied to the commit-hash link that precedes the reference list.
+GENERATED_REFERENCES = re.compile(r"(\(\[[0-9a-f]{7,40}\]\([^)\s]+\)\)), closes (?=\[)")
 
 
 def _find(pattern: re.Pattern[str], text: str, origin: str) -> list[re.Match[str]]:
@@ -65,6 +72,22 @@ def _find(pattern: re.Pattern[str], text: str, origin: str) -> list[re.Match[str
     if in_fence:
         raise ValueError(f"unclosed code fence in {origin}")
     return matches
+
+
+def _rewrite_references(notes: str) -> str:
+    """Rewrite release-please's reference suffix on generated ``* `` entry lines only.
+
+    Lines inside fenced code blocks are content and stay unchanged.
+    """
+    lines = []
+    in_fence = False
+    for line in notes.splitlines(keepends=True):
+        if not in_fence and line.startswith("* "):
+            line = GENERATED_REFERENCES.sub(r"\1, refs ", line, count=1)
+        if line.startswith("```"):
+            in_fence = not in_fence
+        lines.append(line)
+    return "".join(lines)
 
 
 def _split(text: str, origin: str, aliases: dict[str, str]) -> tuple[str, dict[str, list[str]]]:
@@ -114,6 +137,7 @@ def compose(base: str, generated: str, version: str) -> str:
     notes = generated[headers[0].end() : stop].strip()
     if not notes or _find(HEADING_1_2, notes, "generated notes"):
         raise ValueError("empty or unsupported generated section")
+    notes = _rewrite_references(notes)
     generated_preamble, generated_bodies = _split(notes, "generated", GENERATED_ALIASES)
     if generated_preamble.strip() or not generated_bodies:
         raise ValueError("generated notes must sit under ### headings")
