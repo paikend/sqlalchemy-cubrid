@@ -31,7 +31,7 @@ CUBRID 是一款高性能开源关系型数据库，在韩国公共部门和企�
 - **庞大的离线测试套件** —— 无需数据库即可运行；CI 在 `offline-tests` 任务中强制执行至少 95% 的行覆盖率（`--cov-fail-under=95`）
 - **并发压力测试** —— 已在真实 CUBRID 上验证 `QueuePool` 同步线程和 `asyncio.gather` 工作负载
 - **面向 SQLAlchemy 2.1 的兼容垫片** —— 私有 API 访问被封装在 `_compat.py` 中（在完成 SA 2.1 全面验证前仍固定为 `<2.2`）
-- 在 **Python 3.10 -- 3.14** 上测试 **4 个 CUBRID 版本**（10.2、11.0、11.2、11.4）
+- 在 **Python 3.11 -- 3.15** 上测试 **4 个 CUBRID 版本**（10.2、11.0、11.2、11.4）
 - CUBRID 特有的 DML 构造：`ON DUPLICATE KEY UPDATE`、`MERGE`、`REPLACE INTO`
 - 开箱即用的 Alembic 迁移支持
 - **三种驱动选项** —— C 扩展（`cubrid://`）、纯 Python（`cubrid+pycubrid://`）或异步纯 Python（`cubrid+aiopycubrid://`）
@@ -57,7 +57,7 @@ flowchart TD
 
 ## 环境要求
 
-- Python 3.10+
+- Python 3.11 或更高版本
 - SQLAlchemy 2.0 – 2.1
 - [CUBRID-Python](https://github.com/CUBRID/cubrid-python)（C 扩展）**或** [pycubrid](https://github.com/cubrid-lab/pycubrid)（纯 Python）
 
@@ -178,7 +178,7 @@ async with AsyncSession(engine) as session:
 
 | 组件 | 支持的版本 |
 |---|---|
-| Python | 3.10、3.11、3.12、3.13、3.14 |
+| Python | 3.11、3.12、3.13、3.14、3.15 |
 | CUBRID | 10.2、11.0、11.2、11.4 |
 | SQLAlchemy | 2.0–2.1 |
 | Alembic | >=1.7.2 |
@@ -206,7 +206,7 @@ engine = create_engine("cubrid://dba:password@localhost:33000/demodb")
 
 ### 支持哪些 Python 版本？
 
-支持 Python 3.10、3.11、3.12、3.13 和 3.14。
+支持 Python 3.11、3.12、3.13、3.14 和 3.15（标准 GIL 构建）。
 
 ### CUBRID 支持 RETURNING 子句吗？
 
