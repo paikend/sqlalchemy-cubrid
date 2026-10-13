@@ -54,6 +54,7 @@ CUBRID-specific notes
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Literal
 
 import sqlalchemy as sa
@@ -541,6 +542,147 @@ class CubridImpl(DefaultImpl):
         if unbounded_name == "STRING" or unbounded_name.endswith("STRING"):
             return getattr(unbounded_side, "length", None) is None
         return False
+
+    def correct_for_autogen_constraints(
+        self,
+        conn_unique_constraints: Any,
+        conn_indexes: Any,
+        metadata_unique_constraints: Any,
+        metadata_indexes: Any,
+    ) -> None:
+        """Drop same-named index pairs whose CUBRID signatures match (#869).
+
+        Alembic before 1.12 never calls :meth:`compare_indexes` and compares
+        only column names, so an unchanged expression, filtered or prefix
+        index would be proposed again on every run. Taking the equal pairs out
+        here keeps autogenerate stable on every supported Alembic; detecting a
+        changed sort order, filter or prefix length needs Alembic 1.12+.
+        """
+        super().correct_for_autogen_constraints(
+            conn_unique_constraints, conn_indexes, metadata_unique_constraints, metadata_indexes
+        )
+        metadata_by_name = {index.name: index for index in metadata_indexes if index.name}
+        for conn_index in list(conn_indexes):
+            metadata_index = metadata_by_name.get(conn_index.name)
+            if (
+                metadata_index is not None
+                and bool(metadata_index.unique) == bool(conn_index.unique)
+                and self._index_signature(metadata_index) == self._index_signature(conn_index)
+            ):
+                conn_indexes.discard(conn_index)
+                metadata_indexes.discard(metadata_index)
+
+    def compare_indexes(self, metadata_index: Any, reflected_index: Any) -> Any:
+        """Compare expression, sort order, filter and prefix-length keys (#869).
+
+        The reflected index carries CUBRID's own spelling (``lower([a])``,
+        ``c>3``); both sides are compiled and normalized before comparing, so
+        an unchanged expression, ``DESC``, ``cubrid_where`` or
+        ``cubrid_length`` index is not proposed again on every autogenerate.
+        Alembic 1.12+ calls this hook.
+        """
+        from alembic.ddl.impl import ComparisonResult
+
+        messages = []
+        unique_message = self._compare_index_unique(metadata_index, reflected_index)
+        if unique_message:
+            messages.append(unique_message)
+        metadata_sig = self._index_signature(metadata_index)
+        reflected_sig = self._index_signature(reflected_index)
+        for label, metadata_value, reflected_value in zip(
+            ("expressions", "cubrid_where", "cubrid_length"), metadata_sig, reflected_sig
+        ):
+            if metadata_value != reflected_value:
+                messages.append(f"{label} {reflected_value!r} to {metadata_value!r}")
+        if messages:
+            return ComparisonResult.Different(messages)
+        return ComparisonResult.Equal()
+
+    def _index_signature(self, index: Any) -> tuple[Any, ...]:
+        table_name = index.table.name if index.table is not None else None
+        keys = tuple(
+            # ASC is CUBRID's default order, and reflection reports only DESC.
+            re.sub(
+                r" asc$",
+                "",
+                self._normalize_index_sql(self._compile_index_element(expr), table_name),
+            )
+            for expr in index.expressions
+        )
+        options = index.dialect_options["cubrid"]
+        where = options.get("where")
+        where_sig = (
+            None
+            if where is None
+            else self._normalize_index_sql(self._compile_index_element(where), table_name)
+        )
+        length = options.get("length")
+        if length is None:
+            length_sig: dict[str, int] | None = None
+        elif isinstance(length, dict):
+            length_sig = {str(name).lower(): int(value) for name, value in length.items()}
+        else:
+            length_sig = {
+                column.name.lower(): int(length) for column in index.columns if column is not None
+            }
+        return keys, where_sig, length_sig or None
+
+    def _compile_index_element(self, element: Any) -> str:
+        if isinstance(element, str):
+            return element
+        return str(
+            element.compile(
+                dialect=self.dialect,
+                compile_kwargs={"literal_binds": True, "include_table": False},
+            )
+        )
+
+    @staticmethod
+    def _normalize_index_sql(sql: str, table_name: str | None) -> str:
+        """Normalize case, identifier quotes, table qualifiers and whitespace.
+
+        Only outside ``'...'`` literals: ``a = 't.x'`` and ``a = '[x]'`` stay
+        different from ``a = 'x'``.
+        """
+
+        def outside(segment: str) -> str:
+            segment = segment.lower().replace("[", "").replace("]", "").replace('"', "")
+            if table_name:
+                segment = segment.replace(f"{table_name.lower()}.", "")
+            # Collapse whitespace but keep token boundaries (``a desc`` is not
+            # the column ``adesc``); spaces next to punctuation carry nothing.
+            segment = re.sub(r"\s+", " ", segment)
+            return re.sub(r" ?([^\w ]) ?", r"\1", segment)
+
+        parts = []
+        position = 0
+        while position < len(sql):
+            quote = sql.find("'", position)
+            if quote < 0:
+                parts.append(outside(sql[position:]))
+                break
+            parts.append(outside(sql[position:quote]))
+            end = quote + 1
+            while end < len(sql):
+                if sql[end] == "'" and sql[end + 1 : end + 2] == "'":
+                    end += 2
+                    continue
+                if sql[end] == "'":
+                    break
+                end += 1
+            parts.append(sql[quote : end + 1])
+            position = end + 1
+        sql = "".join(parts).strip()
+        while sql.startswith("(") and sql.endswith(")"):
+            depth = 0
+            for position, char in enumerate(sql):
+                depth += {"(": 1, ")": -1}.get(char, 0)
+                if depth == 0:
+                    break
+            if position != len(sql) - 1:
+                break
+            sql = sql[1:-1]
+        return sql
 
     def create_index(self, index: Any, **kw: Any) -> None:
         """Error on UNIQUE index that collides with an FK auto-index.

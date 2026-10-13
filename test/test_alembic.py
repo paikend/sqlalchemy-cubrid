@@ -1171,3 +1171,143 @@ class TestAutogenerateRegression:
             reflected_schema,
             compare_type=self._compare_type_with_collection_alias,
         )
+
+
+class TestCompareIndexShapes869:
+    """#869: reflected CUBRID index spellings compare equal to the model."""
+
+    @staticmethod
+    def _impl():
+        from sqlalchemy_cubrid.alembic_impl import CubridImpl
+
+        impl = object.__new__(CubridImpl)
+        impl.dialect = CubridDialect()
+        return impl
+
+    @staticmethod
+    def _pair():
+        model = sa.Table(
+            "t", sa.MetaData(), sa.Column("a", sa.String(20)), sa.Column("b", sa.Integer)
+        )
+        reflected = sa.Table(
+            "t", sa.MetaData(), sa.Column("a", sa.String(20)), sa.Column("b", sa.Integer)
+        )
+        return model, reflected
+
+    @pytest.mark.parametrize(
+        ("model_args", "model_kw", "reflected_args", "reflected_kw"),
+        [
+            (lambda t: [sa.func.lower(t.c.a)], {}, lambda t: [sa.text("lower([a])")], {}),
+            (lambda t: [t.c.b.desc(), t.c.a], {}, lambda t: [t.c.b.desc(), t.c.a], {}),
+            (
+                lambda t: [t.c.b],
+                {"cubrid_where": lambda t: t.c.b > 3},
+                lambda t: [t.c.b],
+                {"cubrid_where": "b>3"},
+            ),
+            (
+                lambda t: [t.c.a],
+                {"cubrid_length": 5},
+                lambda t: [t.c.a],
+                {"cubrid_length": {"a": 5}},
+            ),
+            (
+                lambda t: [t.c.b, sa.func.lower(t.c.a).desc()],
+                {},
+                lambda t: [t.c.b, sa.text("lower([a]) DESC")],
+                {},
+            ),
+        ],
+    )
+    def test_equal(self, model_args, model_kw, reflected_args, reflected_kw):
+        model, reflected = self._pair()
+        kw = {k: (v(model) if callable(v) else v) for k, v in model_kw.items()}
+        m_index = sa.Index("ix", *model_args(model), _table=model, **kw)
+        r_index = sa.Index("ix", *reflected_args(reflected), _table=reflected, **reflected_kw)
+        assert self._impl().compare_indexes(m_index, r_index).is_equal
+
+    @pytest.mark.parametrize(
+        ("model_kw", "reflected_kw", "label"),
+        [
+            ({"cubrid_where": "b>4"}, {"cubrid_where": "b>3"}, "cubrid_where"),
+            ({"cubrid_length": {"a": 6}}, {"cubrid_length": {"a": 5}}, "cubrid_length"),
+            ({}, {"cubrid_where": "b>3"}, "cubrid_where"),
+        ],
+    )
+    def test_option_change_is_different(self, model_kw, reflected_kw, label):
+        model, reflected = self._pair()
+        m_index = sa.Index("ix", model.c.a, _table=model, **model_kw)
+        r_index = sa.Index("ix", reflected.c.a, _table=reflected, **reflected_kw)
+        result = self._impl().compare_indexes(m_index, r_index)
+        assert result.is_different
+        assert label in result.message
+
+    def test_sort_order_and_unique_changes_are_different(self):
+        model, reflected = self._pair()
+        result = self._impl().compare_indexes(
+            sa.Index("ix", model.c.b, _table=model, unique=True),
+            sa.Index("ix", reflected.c.b.desc(), _table=reflected),
+        )
+        assert result.is_different
+        assert "unique=False to unique=True" in result.message
+        assert "expressions" in result.message
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("((a))", "a"),
+            ("(a)+(b)", "(a)+(b)"),
+            ("lower([T].[A])", "lower(a)"),
+            ("(c > 3)", "c>3"),
+            ("a = 't.x'", "a='t.x'"),
+            ("a = '[X] y'", "a='[X] y'"),
+            ("T.A = 'It''s'", "a='It''s'"),
+            ("a  DESC", "a desc"),
+            ("adesc", "adesc"),
+            ("x in (1, 2)", "x in(1,2)"),
+        ],
+    )
+    def test_normalize_index_sql(self, sql, expected):
+        from sqlalchemy_cubrid.alembic_impl import CubridImpl
+
+        assert CubridImpl._normalize_index_sql(sql, "t") == expected
+
+    def test_string_literal_change_is_different(self):
+        model, reflected = self._pair()
+        result = self._impl().compare_indexes(
+            sa.Index("ix", model.c.a, _table=model, cubrid_where="a = 't.x'"),
+            sa.Index("ix", reflected.c.a, _table=reflected, cubrid_where="a = 'x'"),
+        )
+        assert result.is_different
+
+    def test_correct_for_autogen_constraints_drops_only_equal_pairs(self):
+        """Alembic < 1.12 never calls compare_indexes; equal pairs leave the sets."""
+        model, reflected = self._pair()
+        m_func = sa.Index("ix_func", sa.func.lower(model.c.a), _table=model)
+        r_func = sa.Index("ix_func", sa.text("lower([a])"), _table=reflected)
+        m_filt = sa.Index("ix_filt", model.c.b, _table=model, cubrid_where="b>4")
+        r_filt = sa.Index("ix_filt", reflected.c.b, _table=reflected, cubrid_where="b>3")
+        m_new = sa.Index("ix_new", model.c.a, _table=model)
+        conn_indexes, metadata_indexes = {r_func, r_filt}, {m_func, m_filt, m_new}
+
+        self._impl().correct_for_autogen_constraints(set(), conn_indexes, set(), metadata_indexes)
+
+        assert conn_indexes == {r_filt}
+        assert metadata_indexes == {m_filt, m_new}
+
+    def test_explicit_asc_equals_reflected_default_order(self):
+        model, reflected = self._pair()
+        result = self._impl().compare_indexes(
+            sa.Index("ix", model.c.a.asc(), _table=model),
+            sa.Index("ix", reflected.c.a, _table=reflected),
+        )
+        assert result.is_equal
+
+    def test_desc_key_differs_from_a_column_named_like_it(self):
+        model = sa.Table("t", sa.MetaData(), sa.Column("adesc", sa.Integer))
+        reflected = sa.Table("t", sa.MetaData(), sa.Column("a", sa.Integer))
+        result = self._impl().compare_indexes(
+            sa.Index("ix", model.c.adesc, _table=model),
+            sa.Index("ix", reflected.c.a.desc(), _table=reflected),
+        )
+        assert result.is_different
