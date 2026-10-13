@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **Unused `display_width` and `values` type arguments (#870)** — `SMALLINT` /
+  `BIGINT` accept `display_width` and `CHAR` / `VARCHAR` / `NCHAR` / `NVARCHAR` /
+  `STRING` accept `values`, but neither ever changed the DDL or any behavior. Passing
+  them now emits a `DeprecationWarning`; they are still accepted and ignored, and will
+  be removed in a future major release. The unused private `CubridTypeCompiler._get`
+  helper is gone.
+
 ### Fixed
+
+- **Reflection of names containing `:name`, collection type classes and join linting
+  (#870)** — the `SHOW COLUMNS` / `SHOW INDEXES` / `SHOW CREATE TABLE` / `SHOW CREATE
+  VIEW` statements were built with `text()`, so a table named `x :y` or `w (:z)` failed
+  with "A value is required for bind parameter 'y'"; colons are now escaped, and the
+  SQL sent is unchanged. `SET(Integer)` (a type class, which SQLAlchemy accepts
+  elsewhere) failed `create_all` with "_compiler_dispatch() missing ... 'visitor'";
+  collection member classes are now instantiated. `visit_join` dropped `from_linter`, so
+  SQLAlchemy reported a joined select as a cartesian product and missed a real one; the
+  join edges are now recorded as in the base compiler.
 
 - **Expression, descending, filtered and prefix indexes reflect and autogenerate (#869)** —
   `get_indexes()` reported `CREATE INDEX ix ON t (LOWER(a))` as `column_names: [None]`
