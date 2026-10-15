@@ -6,6 +6,7 @@ import importlib.util
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -389,6 +390,11 @@ def test_a_docs_line_starting_with_an_issue_number_is_reported(tmp_path: Path) -
         ("> a\n  > #669 indented marker on a continuation line\n", [2]),
         # The site renders this line as a heading and the comment delimiters as text.
         ("Text <!--\n#670 inside an inline comment\n--> tail\n", [2]),
+        # A block quote inside a list item (#925); two spaces after ">" stay text.
+        ("- > #750 issue\n\n1. > #751 numbered\n\n- >  #752 text\n", [1, 3]),
+        ("- a\n\n    > #753 later paragraph\n    > #754 next\n", [3, 4]),
+        ("> - > #755 nested both ways\n", [1]),
+        ("- a\n\n  > #756 quote after a two-space indent\n", [3]),
     ],
 )
 def test_issue_number_lines_are_reported_where_the_site_makes_headings(
@@ -480,6 +486,16 @@ def test_only_parsed_html_and_link_tails_are_masked(
     tmp_path: Path, page: str, found: list[str]
 ) -> None:
     assert check.run(_tree(tmp_path, page)) == found
+
+
+@pytest.mark.parametrize(
+    "line", ["-  " * 28 + "ordinary text", "1234567890.  " * 28 + "text", "> " * 200 + "text"]
+)
+def test_long_container_prefixes_are_scanned_in_linear_time(tmp_path: Path, line: str) -> None:
+    # A backtracking pattern took seconds on these lines (#925 review).
+    started = time.perf_counter()
+    assert check.run(_tree(tmp_path, f"{line}\n{line}\n")) == []
+    assert time.perf_counter() - started < 1.0
 
 
 def test_html_attributes_are_parsed_like_a_browser(tmp_path: Path) -> None:
