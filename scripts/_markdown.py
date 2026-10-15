@@ -13,17 +13,62 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 
 from markdown_it import MarkdownIt
-from markdown_it.common.utils import unescapeAll
+from markdown_it.rules_inline import autolink as _autolink_rule
+from markdown_it.rules_inline import html_inline as _html_inline_rule
+from markdown_it.rules_inline import image as _image_rule
+from markdown_it.rules_inline import link as _link_rule
+from markdown_it.rules_inline.state_inline import StateInline
 from markdown_it.token import Token
 
+_InlineRule = Callable[[StateInline, bool], bool]
+
+
+def _recording(rule: _InlineRule, kind: str) -> _InlineRule:
+    """Wrap a markdown-it inline rule to record the source span of what it parsed.
+
+    The first new token of type ``kind`` gets ``meta["span"]``, the span relative
+    to the inline source. A link or an image also gets ``meta["tail"]``: the
+    source after its text, ``(dest "title")`` of an inline link, ``[label]`` or
+    nothing of a reference one. Line numbers and masking use these positions, not
+    the decoded text, which can differ from the source or occur twice.
+    """
+
+    def recorded(state: StateInline, silent: bool) -> bool:
+        start, count = state.pos, len(state.tokens)
+        if not rule(state, silent):
+            return False
+        if silent:
+            return True
+        for token in state.tokens[count:]:
+            if token.type != kind:
+                continue
+            token.meta["span"] = (start, state.pos)
+            if rule in (_link_rule, _image_rule):
+                is_link = state.src[start] == "["
+                bracket = start if is_link else start + 1
+                label_end = state.md.helpers.parseLinkLabel(state, bracket, is_link)
+                token.meta["tail"] = (label_end + 1, state.pos)
+            break
+        return True
+
+    return recorded
+
+
 _PARSER = MarkdownIt("commonmark").enable("table")
+for _name, _rule, _kind in (
+    ("link", _link_rule, "link_open"),
+    ("image", _image_rule, "image"),
+    ("autolink", _autolink_rule, "link_open"),
+    ("html_inline", _html_inline_rule, "html_inline"),
+):
+    _PARSER.inline.ruler.at(_name, _recording(_rule, _kind))
 _ATTR_ID = re.compile(r"\s*\{[^}]*#([\w-]+)[^}]*\}\s*$")
-_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 # Python-Markdown reads ``#<digit>`` at the start of a block line as an ATX
 # heading. Its block quotes strip ``>`` (after up to 3 spaces) and one space,
 # list items start after their marker (``-``, ``*``, ``+``, ``1.``; not
@@ -138,22 +183,10 @@ def _mask_code_spans(raw: str) -> str:
         position = closing.end()
 
 
-def _inline_title_newlines(child: Token, raw_titles: list[str]) -> int:
-    """Return the source newlines of a link or image title written in this inline source.
-
-    ``raw_titles`` are the titles of the inline link tails of the source, as
-    written. markdown-it decodes entities and escapes in a title (``&#10;`` is a
-    newline), so the title is matched to the first unused raw title that decodes
-    to it, and that raw text's newlines are counted. A reference link or image
-    has no tail here: its title comes from the definition and adds no line.
-    """
-    title = str(child.attrGet("title") or "")
-    if "\n" not in title:
-        return 0  # decoding never removes a source newline
-    for index, raw_title in enumerate(raw_titles):
-        if unescapeAll(raw_title) == title:
-            return raw_titles.pop(index).count("\n")
-    return 0
+def _tail_newlines(raw: str, child: Token) -> tuple[int, int]:
+    """Return the source newlines of a link's or image's tail, and the tail's end."""
+    start, end = child.meta.get("tail", (0, 0))
+    return raw.count("\n", start, end), end
 
 
 def _inline_items(token: Token) -> list[tuple[int, Token]]:
@@ -161,25 +194,29 @@ def _inline_items(token: Token) -> list[tuple[int, Token]]:
 
     Soft and hard breaks start a new line. A code span or an inline HTML tag
     that spans lines moves the following children down by its newlines (found
-    in the raw source for code spans), and a multi-line link or image title
-    moves the children after the link (the title follows the link text).
+    in the raw source for code spans), and the newlines of a link or image tail
+    (its destination and title, or its reference label) move the children after
+    the link, since the tail follows the link text.
     """
     raw = token.content
-    raw_titles = _raw_titles(_HTML_COMMENT.sub(lambda m: _blank(m.group(0)), _mask_code_spans(raw)))
     cursor, offset = 0, 0
-    pending_titles: list[int] = []
+    pending_titles: list[tuple[int, int]] = []
     items = []
     for child in token.children or []:
         items.append((offset, child))
         if child.type == "link_open":
-            pending_titles.append(_inline_title_newlines(child, raw_titles))
+            pending_titles.append(_tail_newlines(raw, child))
         elif child.type == "link_close" and pending_titles:
-            offset += pending_titles.pop()
+            newlines, end = pending_titles.pop()
+            offset += newlines
+            cursor = max(cursor, end)
         elif child.type == "image":
             alt_breaks = sum(
                 1 for c in child.children or [] if c.type in ("softbreak", "hardbreak")
             )
-            offset += alt_breaks + _inline_title_newlines(child, raw_titles)
+            newlines, end = _tail_newlines(raw, child)
+            offset += alt_breaks + newlines
+            cursor = max(cursor, end)
         elif child.type == "html_inline":
             start = raw.find(child.content, cursor)
             if start >= 0:
@@ -243,108 +280,44 @@ def _blank(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
-def _link_tail(raw: str, index: int) -> tuple[int, str]:
-    """Return the index after the ``)`` of an inline link tail at ``index``, and its raw title.
+def _parsed_spans(children: list[Token], source: str, base: int = 0) -> list[tuple[int, int]]:
+    """Return the source spans of the inline HTML, autolinks and inline link tails.
 
-    CommonMark: optional whitespace, a destination (``<...>``, or bare text with
-    balanced parentheses and no whitespace, where a quote is an ordinary
-    character), optional whitespace, an optional title (``"..."``, ``'...'`` or
-    ``(...)``, which must follow whitespace), optional whitespace, then ``)``.
-    Backslash escapes are honoured. A malformed tail (no closing ``)``, or text
-    after the title) is not a link: ``-1``. The title is ``""`` when there is none.
+    Only what markdown-it parsed counts: a tag, a comment or an autolink, and the
+    ``(dest "title")`` tail of a link or an image that is a link. An image's alt
+    text is parsed on its own, from the image's label, so the spans of its
+    children are moved by the label's start (``base``) into ``source``.
     """
-    size = len(raw)
-
-    def skip_space(at: int) -> int:
-        while at < size and raw[at] in " \t\n":
-            at += 1
-        return at
-
-    index = skip_space(index)
-    if index < size and raw[index] == "<":
-        index += 1
-        while index < size and raw[index] not in ">\n":
-            index += 2 if raw[index] == "\\" else 1
-        index += 1
-    else:
-        depth = 0
-        while index < size and raw[index] not in " \t\n":
-            char = raw[index]
-            if char == "\\":
-                index += 2
-                continue
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                if depth == 0:
-                    return index + 1, ""
-                depth -= 1
-            index += 1
-    before_title = index
-    index = skip_space(index)
-    title = ""
-    if index > before_title and index < size and raw[index] in "\"'(":
-        closer = ")" if raw[index] == "(" else raw[index]
-        index += 1
-        title_start = index
-        while index < size and raw[index] != closer:
-            index += 2 if raw[index] == "\\" else 1
-        title = raw[title_start:index]
-        index += 1
-        index = skip_space(index)
-    if index < size and raw[index] == ")":
-        return index + 1, title
-    return -1, ""
-
-
-def _raw_titles(raw: str) -> list[str]:
-    """Return the raw titles of the inline link tails of ``raw``, in source order."""
-    titles = []
-    position = 0
-    while (opening := raw.find("](", position)) >= 0:
-        index, title = _link_tail(raw, opening + 2)
-        if index < 0:
-            position = opening + 2
-            continue
-        titles.append(title)
-        position = index
-    return titles
-
-
-def _mask_link_tails(raw: str) -> str:
-    """Blank inline link destinations and titles: ``](dest "title")``.
-
-    The tail is scanned as CommonMark defines it (``_link_tail``), so an
-    apostrophe inside a bare destination does not open a title.
-    """
-    out = list(raw)
-    position = 0
-    while (opening := raw.find("](", position)) >= 0:
-        index, _ = _link_tail(raw, opening + 2)
-        if index < 0:  # not a link tail: leave it, and look past this "]("
-            position = opening + 2
-            continue
-        for spot in range(opening + 1, index):
-            if out[spot] != "\n":
-                out[spot] = " "
-        position = index
-    return "".join(out)
+    spans = []
+    for child in children:
+        span = None
+        if child.type == "html_inline" or child.markup == "autolink":
+            span = child.meta.get("span")
+        elif child.type in ("link_open", "image"):
+            span = child.meta.get("tail")
+            if span and source[base + span[0] : base + span[0] + 1] != "(":
+                span = None  # a reference link: its label is checked below
+        if span:
+            spans.append((base + span[0], base + span[1]))
+        if child.type == "image" and child.children and "span" in child.meta:
+            label_start = base + child.meta["span"][0] + 2  # after "!["
+            spans += _parsed_spans(child.children, source, label_start)
+    return spans
 
 
 def _undefined_references(token: Token, defined: set[str]) -> list[Link]:
     """Return unescaped ``[text][label]`` uses, outside code, whose label is undefined.
 
-    Code spans, HTML (tags, autolinks, comments) and inline link destinations
-    and titles are blanked first, so brackets in a URL or a title are not links.
+    Code spans, and the inline HTML (tags, comments), autolinks and inline link
+    destinations and titles that markdown-it parsed, are blanked first at their
+    source positions, so brackets in a URL, a title or a tag are not links. Text
+    that only looks like a link tail or a tag stays, and is checked.
     """
     if token.map is None:
         return []
     raw = _mask_code_spans(token.content)
-    # Comments first, so a link tail is not scanned from inside one; then link
-    # tails, before tags: a <...> destination must keep its brackets to be scanned.
-    raw = _HTML_COMMENT.sub(lambda m: _blank(m.group(0)), raw)
-    raw = _mask_link_tails(raw)
-    raw = re.sub(r"<[^<>\n]*>", lambda m: _blank(m.group(0)), raw)
+    for start, end in _parsed_spans(token.children or [], token.content):
+        raw = raw[:start] + _blank(raw[start:end]) + raw[end:]
     found = []
     for match in _REFERENCE.finditer(raw):
         label = " ".join((match.group(2) or match.group(1)).split()).casefold()
@@ -478,9 +451,12 @@ def _continues(text: str) -> str:
     single quotes (where a backslash is literal); ``\\\\`` at the end, or a
     backslash followed by spaces, does not continue. ``"quote"``: a quote is
     still open, so the newline is part of the quoted text. ``""``: the command
-    ends here. A backslash or a quote in a comment continues nothing.
+    ends here. A backslash or a quote in a comment continues nothing; ``#``
+    starts a comment only at the start of a word, so not after ``x\\ `` (an
+    escaped space keeps the word open) or after a closing quote.
     """
     quote = ""
+    in_word = False
     index = 0
     while index < len(text):
         char = text[index]
@@ -490,10 +466,17 @@ def _continues(text: str) -> str:
             if index == len(text) - 1:
                 return "backslash"
             index += 1
+            in_word = True
+        elif quote:
+            quote = "" if char == quote else quote
         elif char in "'\"":
-            quote = "" if quote == char else (quote or char)
-        elif char == "#" and not quote and (index == 0 or text[index - 1] in " \t;&|()<>\n"):
+            quote, in_word = char, True
+        elif char in " \t\n;&|()<>":
+            in_word = False
+        elif char == "#" and not in_word:
             return ""  # a comment: a backslash in it does not continue the line
+        else:
+            in_word = True
         index += 1
     return "quote" if quote else ""
 
