@@ -14,7 +14,7 @@ from typing import Any, Iterable, Iterator, Protocol, cast
 
 from sqlalchemy.exc import CompileError
 from sqlalchemy.schema import CreateIndex
-from sqlalchemy.sql import compiler, dml, elements, operators, schema, selectable
+from sqlalchemy.sql import compiler, dml, elements, functions, operators, schema, selectable
 from sqlalchemy.sql.expression import text as text_clause
 from sqlalchemy.sql import sqltypes
 
@@ -65,7 +65,7 @@ class _BaseDMLCompiler(Protocol):
 
 
 class _BaseSelectCompiler(Protocol):
-    """Typed boundaries for the SELECT-list hooks used for #966."""
+    """Typed boundaries for the SELECT-list and ORDER BY hooks used for #966 and #968."""
 
     def _label_select_column(self, select: Any, column: Any, *args: Any, **kw: Any) -> Any: ...
 
@@ -78,6 +78,12 @@ class _BaseSelectCompiler(Protocol):
     ) -> str: ...
 
     def visit_expression_clauselist(self, clauselist: Any, **kw: Any) -> str: ...
+
+    def visit_function(self, func: Any, add_to_result_map: Any = None, **kw: Any) -> str:
+        """Render a SQL function call (SQLAlchemy compiler hook, used for #968)."""
+
+    def function_argspec(self, func: Any, **kw: Any) -> str:
+        """Render a SQL function's argument list (SQLAlchemy compiler hook, used for #968)."""
 
 
 class _BaseDDLCompiler(Protocol):
@@ -166,25 +172,86 @@ class CubridCompiler(compiler.SQLCompiler):
         return self.visit_is_distinct_from_binary(binary, operator, **kw)
 
     # CUBRID rejects ``EXISTS (...)``, ``NOT (...)`` and ``a AND b`` / ``a OR b``
-    # as a bare SELECT-list item ("SELECT EXISTS (SELECT 1)" is a syntax error)
-    # but accepts each inside parentheses, so ``query(q.exists()).scalar()``
-    # failed (#966). Group only the expression that is itself the column (or
-    # the element of its label); the same expression anywhere else, such as a
-    # WHERE clause or a CASE condition, renders as before.
+    # as a bare SELECT-list item ("SELECT EXISTS (SELECT 1)" is a syntax error),
+    # as a CAST or function argument and as an ORDER BY item, but accepts each
+    # inside parentheses, so ``query(q.exists()).scalar()`` failed (#966), as
+    # did ``cast(and_(...), Integer)``, ``func.coalesce(exists(), False)`` and
+    # ``order_by(a & b)`` (#968). Group such an expression only on the path from
+    # one SELECT column or ORDER BY item through labels, type coercions, sort
+    # modifiers, CASTs and function arguments: the item and its wrappers are
+    # matched by identity, one item at a time, and a CAST or function on the
+    # path groups its own direct operands while it renders them. The same
+    # expression anywhere else (WHERE, HAVING, ON, GROUP BY, a CASE condition, a
+    # window ORDER BY or another operand) renders as before, even when it is the
+    # same object. CUBRID rejects a search condition as a GROUP BY item even
+    # inside parentheses, so GROUP BY stays unchanged.
 
-    _cubrid_select_column: Any = None
+    _cubrid_item: frozenset[int] = frozenset()
+    _cubrid_path_functions: frozenset[int] = frozenset()
+
+    @staticmethod
+    def _cubrid_chain(expression: Any) -> list[Any]:
+        """The expression, then what it renders through labels, coercions and sort modifiers."""
+        chain = [expression]
+        while True:
+            # An ORDER BY label arrives wrapped in a _label_reference; when the
+            # label is not selected, its whole expression renders there.
+            if isinstance(expression, (elements.Label, elements._label_reference)):
+                expression = expression.element
+            elif isinstance(expression, elements.TypeCoerce):
+                expression = expression.clause
+            elif isinstance(expression, elements.UnaryExpression) and expression.modifier in (
+                operators.asc_op,
+                operators.desc_op,
+                operators.nulls_first_op,
+                operators.nulls_last_op,
+            ):
+                expression = expression.element
+            else:
+                return chain
+            chain.append(expression)
+
+    @staticmethod
+    def _cubrid_is_condition(expression: Any) -> bool:
+        if isinstance(expression, elements.UnaryExpression):
+            return expression.operator is operators.exists or expression.operator is operators.inv
+        return isinstance(expression, elements.BooleanClauseList) and expression.operator in (
+            operators.and_,
+            operators.or_,
+        )
+
+    def _cubrid_operand(self, operand: Any, **kw: Any) -> str:
+        """Render a direct operand of a CAST or function on the grouping path."""
+        end = self._cubrid_chain(operand)[-1]
+        if self._cubrid_is_condition(end):
+            return "(%s)" % operand._compiler_dispatch(self, **kw)
+        if isinstance(end, (elements.Cast, functions.FunctionElement)):
+            kw["_cubrid_path"] = True
+        return str(operand._compiler_dispatch(self, **kw))
 
     def _label_select_column(self, select: Any, column: Any, *args: Any, **kw: Any) -> Any:
-        previous = self._cubrid_select_column
-        self._cubrid_select_column = (
-            column.element if isinstance(column, elements.Label) else column
-        )
+        previous = self._cubrid_item
+        self._cubrid_item = frozenset(map(id, self._cubrid_chain(column)))
         try:
             return cast(_BaseSelectCompiler, super())._label_select_column(
                 select, column, *args, **kw
             )
         finally:
-            self._cubrid_select_column = previous
+            self._cubrid_item = previous
+
+    def order_by_clause(self, select: Any, **kw: Any) -> str:
+        # SQLAlchemy's order_by_clause, rendering one item at a time.
+        rendered = []
+        previous = self._cubrid_item
+        try:
+            for item in select._order_by_clauses:
+                self._cubrid_item = frozenset(map(id, self._cubrid_chain(item)))
+                text = item._compiler_dispatch(self, **kw)
+                if text:
+                    rendered.append(text)
+        finally:
+            self._cubrid_item = previous
+        return " ORDER BY " + ", ".join(rendered) if rendered else ""
 
     def visit_unary(
         self,
@@ -196,7 +263,7 @@ class CubridCompiler(compiler.SQLCompiler):
         text = cast(_BaseSelectCompiler, super()).visit_unary(
             unary, add_to_result_map, result_map_targets, **kw
         )
-        if unary is self._cubrid_select_column and (
+        if id(unary) in self._cubrid_item and (
             unary.operator is operators.exists or unary.operator is operators.inv
         ):
             return "(%s)" % text
@@ -204,18 +271,39 @@ class CubridCompiler(compiler.SQLCompiler):
 
     def visit_expression_clauselist(self, clauselist: Any, **kw: Any) -> str:
         text = cast(_BaseSelectCompiler, super()).visit_expression_clauselist(clauselist, **kw)
-        if clauselist is self._cubrid_select_column and clauselist.operator in (
+        if id(clauselist) in self._cubrid_item and clauselist.operator in (
             operators.and_,
             operators.or_,
         ):
             return "(%s)" % text
         return text
 
+    def visit_function(self, func: Any, add_to_result_map: Any = None, **kw: Any) -> str:
+        base = cast(_BaseSelectCompiler, super())
+        if not (kw.pop("_cubrid_path", False) or id(func) in self._cubrid_item):
+            return base.visit_function(func, add_to_result_map, **kw)
+        previous = self._cubrid_path_functions
+        self._cubrid_path_functions = previous | {id(func)}
+        try:
+            return base.visit_function(func, add_to_result_map, **kw)
+        finally:
+            self._cubrid_path_functions = previous
+
+    def function_argspec(self, func: Any, **kw: Any) -> str:
+        if id(func) not in self._cubrid_path_functions:
+            return cast(_BaseSelectCompiler, super()).function_argspec(func, **kw)
+        # SQLAlchemy renders the arguments as a parenthesized, comma-separated list.
+        arguments = (self._cubrid_operand(argument, **kw) for argument in func.clauses)
+        return "(%s)" % ", ".join(text for text in arguments if text)
+
     def visit_cast(self, cast: Any, **kw: Any) -> str:
         # https://www.cubrid.org/manual/en/11.0/sql/function/typecast_fn.html#cast
+        on_path = kw.pop("_cubrid_path", False) or id(cast) in self._cubrid_item
         type_ = self.process(cast.typeclause, **kw)
         if type_ is None:
             return self.process(cast.clause.self_group(), **kw)
+        if on_path:
+            return f"CAST({self._cubrid_operand(cast.clause, **kw)} AS {type_})"
         return f"CAST({self.process(cast.clause, **kw)} AS {type_})"
 
     def default_from(self) -> str:
