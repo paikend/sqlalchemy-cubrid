@@ -64,6 +64,22 @@ class _BaseDMLCompiler(Protocol):
         """Render the pending WITH clause (private SQLAlchemy hook, used for #591)."""
 
 
+class _BaseSelectCompiler(Protocol):
+    """Typed boundaries for the SELECT-list hooks used for #966."""
+
+    def _label_select_column(self, select: Any, column: Any, *args: Any, **kw: Any) -> Any: ...
+
+    def visit_unary(
+        self,
+        unary: Any,
+        add_to_result_map: Any = None,
+        result_map_targets: tuple[Any, ...] = (),
+        **kw: Any,
+    ) -> str: ...
+
+    def visit_expression_clauselist(self, clauselist: Any, **kw: Any) -> str: ...
+
+
 class _BaseDDLCompiler(Protocol):
     def visit_create_index(
         self,
@@ -148,6 +164,52 @@ class CubridCompiler(compiler.SQLCompiler):
         if isinstance(binary.right, elements.Null):
             return "%s IS NOT NULL" % self.process(binary.left, **kw)
         return self.visit_is_distinct_from_binary(binary, operator, **kw)
+
+    # CUBRID rejects ``EXISTS (...)``, ``NOT (...)`` and ``a AND b`` / ``a OR b``
+    # as a bare SELECT-list item ("SELECT EXISTS (SELECT 1)" is a syntax error)
+    # but accepts each inside parentheses, so ``query(q.exists()).scalar()``
+    # failed (#966). Group only the expression that is itself the column (or
+    # the element of its label); the same expression anywhere else, such as a
+    # WHERE clause or a CASE condition, renders as before.
+
+    _cubrid_select_column: Any = None
+
+    def _label_select_column(self, select: Any, column: Any, *args: Any, **kw: Any) -> Any:
+        previous = self._cubrid_select_column
+        self._cubrid_select_column = (
+            column.element if isinstance(column, elements.Label) else column
+        )
+        try:
+            return cast(_BaseSelectCompiler, super())._label_select_column(
+                select, column, *args, **kw
+            )
+        finally:
+            self._cubrid_select_column = previous
+
+    def visit_unary(
+        self,
+        unary: Any,
+        add_to_result_map: Any = None,
+        result_map_targets: tuple[Any, ...] = (),
+        **kw: Any,
+    ) -> str:
+        text = cast(_BaseSelectCompiler, super()).visit_unary(
+            unary, add_to_result_map, result_map_targets, **kw
+        )
+        if unary is self._cubrid_select_column and (
+            unary.operator is operators.exists or unary.operator is operators.inv
+        ):
+            return "(%s)" % text
+        return text
+
+    def visit_expression_clauselist(self, clauselist: Any, **kw: Any) -> str:
+        text = cast(_BaseSelectCompiler, super()).visit_expression_clauselist(clauselist, **kw)
+        if clauselist is self._cubrid_select_column and clauselist.operator in (
+            operators.and_,
+            operators.or_,
+        ):
+            return "(%s)" % text
+        return text
 
     def visit_cast(self, cast: Any, **kw: Any) -> str:
         # https://www.cubrid.org/manual/en/11.0/sql/function/typecast_fn.html#cast

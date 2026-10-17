@@ -167,6 +167,97 @@ class TestSelectCompilation:
             _compile(stmt)
 
 
+class TestBooleanSelectColumns:
+    """EXISTS, NOT and AND/OR as a SELECT-list item are grouped (#966).
+
+    CUBRID rejects ``SELECT EXISTS (SELECT 1)``, ``SELECT NOT (...)`` and
+    ``SELECT a AND b`` but accepts each inside parentheses.
+    """
+
+    _where = users.c.name == "a"
+
+    @pytest.mark.parametrize(
+        ("column", "expected"),
+        [
+            (
+                sa.exists().where(users.c.name == "a"),
+                "SELECT (EXISTS (SELECT * FROM users WHERE users.name = 'a')) AS anon_1",
+            ),
+            (
+                ~sa.exists().where(users.c.name == "a"),
+                "SELECT (NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))) AS anon_1",
+            ),
+            (
+                sa.and_(users.c.name == "a", users.c.id == 1),
+                "SELECT (users.name = 'a' AND users.id = 1) AS anon_1 FROM users",
+            ),
+            (
+                sa.or_(users.c.name == "a", users.c.id == 1).label("x"),
+                "SELECT (users.name = 'a' OR users.id = 1) AS x FROM users",
+            ),
+            (
+                sa.and_(users.c.name == "a", sa.or_(users.c.id == 1, users.c.id == 2)),
+                "SELECT (users.name = 'a' AND (users.id = 1 OR users.id = 2)) AS anon_1 FROM users",
+            ),
+        ],
+        ids=["exists", "not-exists", "and", "or-labelled", "nested-or-once"],
+    )
+    def test_column_is_grouped(self, column, expected):
+        assert _norm(_compile(select(column))).startswith(expected)
+
+    def test_exists_select_and_subquery_columns_are_grouped(self):
+        exists = sa.exists().where(self._where)
+        assert _norm(_compile(exists.select())).startswith("SELECT (EXISTS (SELECT *")
+        sql = _norm(_compile(select(select(exists.label("x")).subquery())))
+        assert "FROM (SELECT (EXISTS (SELECT * FROM users WHERE users.name = 'a')) AS x" in sql
+
+    def test_orm_query_exists_is_grouped(self):
+        from sqlalchemy import orm
+
+        class Base(orm.DeclarativeBase):
+            pass
+
+        class User(Base):
+            __tablename__ = "orm_users"
+            id = Column(Integer, primary_key=True)
+            name = Column(String(10))
+
+        session = orm.Session()
+        query = session.query(session.query(User).filter(User.name == "a").exists())
+        assert _norm(_compile(query.statement)).startswith(
+            "SELECT (EXISTS (SELECT 1 FROM orm_users WHERE orm_users.name = 'a')) AS anon_1"
+        )
+
+    @pytest.mark.parametrize(
+        ("stmt", "expected"),
+        [
+            (
+                select(users.c.id).where(sa.exists().where(users.c.name == "a")),
+                "WHERE EXISTS (SELECT * FROM users WHERE users.name = 'a')",
+            ),
+            (
+                select(users.c.id).where(~sa.exists().where(users.c.name == "a")),
+                "WHERE NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))",
+            ),
+            (
+                select(users.c.id).where(sa.and_(users.c.name == "a", users.c.id == 1)),
+                "WHERE users.name = 'a' AND users.id = 1",
+            ),
+            (
+                select(sa.case((sa.exists().where(users.c.name == "a"), 1), else_=0)),
+                "SELECT CASE WHEN (EXISTS (SELECT * FROM users WHERE users.name = 'a')) THEN 1",
+            ),
+            (
+                select(sa.case((sa.and_(users.c.name == "a", users.c.id == 1), 1), else_=0)),
+                "SELECT CASE WHEN (users.name = 'a' AND users.id = 1) THEN 1",
+            ),
+        ],
+        ids=["where-exists", "where-not-exists", "where-and", "case-exists", "case-and"],
+    )
+    def test_other_positions_are_unchanged(self, stmt, expected):
+        assert expected in _norm(_compile(stmt))
+
+
 class TestInsertCompilation:
     """Test INSERT statement compilation."""
 
