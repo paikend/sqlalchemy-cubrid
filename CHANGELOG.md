@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EXISTS and AND/OR as a SELECT-list item no longer fail (#966)** — CUBRID rejects a bare
+  `EXISTS (...)`, `NOT (...)` or `a AND b` / `a OR b` as a SELECT-list item with a syntax
+  error (-493) but accepts each inside parentheses, so `select(exists().where(...))`,
+  `exists().select()`, `select(~exists()...)`, `select(and_(...))` and the ORM idiom
+  `session.query(q.exists()).scalar()` failed. The compiler now groups such an expression
+  when it is itself a column (or the element of its label), including inside subqueries and
+  CTEs. The same expressions in `WHERE`, `HAVING`, `ON` or a `CASE` condition render as
+  before.
+
 - **A failed isolation re-apply at transaction start stays pending (#937)** — when re-applying
   the isolation level after a successful commit or rollback failed, `do_begin()` retried it
   but removed the connection's pending mark before the retry ran. If the retry failed too, a

@@ -134,6 +134,7 @@
 - **NULLS FIRST / NULLS LAST**: CUBRID는 `ORDER BY col ASC NULLS FIRST`와 `ORDER BY col DESC NULLS LAST`를 지원합니다. SA 기본 컴파일러가 네이티브로 처리합니다.
 - **GROUP_CONCAT**: CUBRID는 `GROUP_CONCAT([DISTINCT] expr [ORDER BY …] [SEPARATOR '…'])`를 지원합니다. `sa.func.group_concat(column)`을 사용하세요.
 - **LIMIT / OFFSET**: CUBRID는 MySQL 스타일 `LIMIT [offset,] count` 구문을 사용합니다. 오프셋만 주어지면 방언은 "남은 모든 행" 센티넬로 `LIMIT offset, 4611686018427387904`(2^62)를 냅니다 — 사실상 무제한이면서, CUBRID가 내부적으로 계산하는 `offset + count` 덧셈이 부호 있는 BIGINT 범위를 넘어 오버플로하지 않을 만큼 작습니다. CUBRID에는 `FETCH FIRST n ROWS ONLY`가 없으므로 `Select.fetch(n)`도 `LIMIT n`(`.offset()`과 함께면 `LIMIT offset, n`)으로 렌더링됩니다 (#867). `fetch(..., percent=True)`와 `fetch(..., with_ties=True)`는 `LIMIT`에 대응하는 형식이 없으므로 `CompileError`를 발생시킵니다.
+- **불리언 SELECT 목록 항목**: CUBRID는 괄호 없는 `EXISTS (...)`, `NOT (...)`, `a AND b` / `a OR b`를 SELECT 목록 항목으로 거부하지만(`SELECT EXISTS (SELECT 1)`은 구문 오류) 괄호 안에서는 허용합니다. 방언이 이런 컬럼을 괄호로 묶으므로 `select(exists().where(...))`, `select(~exists()...)`, `select(and_(...))`와 ORM의 `session.query(q.exists()).scalar()`가 동작합니다 (#966). `WHERE`, `HAVING`, `ON`, `CASE` 조건 안의 같은 식은 이전과 같이 렌더링됩니다.
 - **조인 변형**: INNER JOIN과 LEFT OUTER JOIN은 정상 컴파일됩니다. FULL OUTER JOIN과 `LATERAL`은 CUBRID가 지원하지 않아 컴파일 중 거부됩니다.
 - **Lateral 조인**: CUBRID는 `LATERAL` 서브쿼리를 지원하지 않습니다. `LATERAL` 키워드는 구문 오류를 일으킵니다.
 - **전문 검색**: CUBRID는 `MATCH … AGAINST` 구문이나 전문 인덱스를 지원하지 않습니다.
