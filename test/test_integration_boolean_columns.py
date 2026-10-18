@@ -2,8 +2,10 @@
 
 CUBRID rejects ``SELECT EXISTS (...)`` and ``SELECT a AND b``; the dialect
 groups such a column (#966), also inside a type coercion, CAST or function
-argument and as an ORDER BY item (#968). Sync, including the ORM
-``query(...).exists()`` idiom, and async. CUBRID rejects a search condition as
+argument and as an ORDER BY item (#968), and as a CAST or function argument
+anywhere in a statement and an ORDER BY / PARTITION BY item of a window or
+WITHIN GROUP (#970). Sync, including the ORM ``query(...).exists()`` idiom,
+and async. CUBRID rejects a search condition as
 a GROUP BY item even in parentheses; grouping by the column's label works.
 """
 
@@ -144,6 +146,61 @@ def test_boolean_group_by_label(engine: sa.Engine) -> None:
             conn.execute(sa.select(sa.func.count()).select_from(_items).group_by(first.element))
 
 
+def test_boolean_operand_outside_select_list(engine: sa.Engine) -> None:
+    other = _items.alias("other")
+    later = sa.exists().where(other.c.id > _items.c.id)
+    first = sa.and_(_items.c.name == "a", _items.c.id == 1)
+    same_b = sa.and_(other.c.id == _items.c.id, other.c.name == "b")
+    last = sa.and_(sa.func.max(_items.c.name) == "b", sa.func.max(_items.c.id) > 1)
+    with engine.connect() as conn:
+        for stmt, ids in (
+            (sa.select(_items.c.id).where(sa.func.coalesce(first, 0) == 1), [1]),
+            (sa.select(_items.c.id).where(sa.cast(~later, Integer) == 1), [2]),
+            (
+                sa.select(_items.c.id).group_by(_items.c.id).having(sa.cast(last, Integer) == 1),
+                [2],
+            ),
+            (
+                sa.select(_items.c.id).select_from(
+                    _items.join(other, sa.func.coalesce(same_b, 0) == 1)
+                ),
+                [2],
+            ),
+        ):
+            assert conn.execute(stmt.order_by(_items.c.id)).scalars().all() == ids
+
+
+def test_boolean_operand_in_update(engine: sa.Engine) -> None:
+    first = sa.and_(_items.c.name == "a", _items.c.id == 1)
+    flag = sa.cast(sa.cast(first, Integer), String(10))
+    with engine.connect() as conn:
+        with conn.begin() as trans:
+            conn.execute(_items.update().values(name=flag).where(_items.c.id == 1))
+            stmt = sa.select(_items.c.name).where(_items.c.id == 1)
+            assert conn.execute(stmt).scalar_one() == "1"
+            trans.rollback()
+
+
+def test_boolean_window_items(engine: sa.Engine) -> None:
+    other = _items.alias("other")
+    later = sa.exists().where(other.c.id > _items.c.id)
+    first = sa.and_(_items.c.name == "a", _items.c.id == 1)
+    row_number = sa.func.row_number
+    with engine.connect() as conn:
+        for window, rows in (
+            (row_number().over(order_by=later), [(1, 2), (2, 1)]),
+            (row_number().over(order_by=(~later).desc()), [(1, 2), (2, 1)]),
+            (row_number().over(partition_by=later, order_by=_items.c.id), [(1, 1), (2, 1)]),
+            (sa.func.sum(_items.c.id).over(order_by=sa.func.coalesce(first, 0)), [(1, 3), (2, 2)]),
+        ):
+            stmt = sa.select(_items.c.id, window).order_by(_items.c.id)
+            assert [tuple(map(int, row)) for row in conn.execute(stmt)] == rows
+        for fraction, expected in ((0.0, False), (1.0, True)):
+            within = sa.func.percentile_disc(fraction).within_group(later)
+            stmt = sa.select(within).select_from(_items)
+            assert bool(conn.execute(stmt).scalar_one()) is expected
+
+
 @pytest_asyncio.fixture
 async def aengine(engine: sa.Engine) -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine(async_url(_sync_url(), os.environ.get("CUBRID_TEST_AURL")))
@@ -160,3 +217,6 @@ async def test_async_exists_column(aengine: AsyncEngine) -> None:
         assert bool((await conn.execute(stmt)).scalar_one()) is True
         stmt = sa.select(sa.cast(sa.exists().where(_items.c.name == "z"), Integer))
         assert (await conn.execute(stmt)).scalar_one() == 0
+        first = sa.and_(_items.c.name == "a", _items.c.id == 1)
+        stmt = sa.select(_items.c.id).where(sa.func.coalesce(first, 0) == 1)
+        assert (await conn.execute(stmt)).scalars().all() == [1]

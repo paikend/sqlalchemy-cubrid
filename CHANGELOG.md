@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EXISTS and AND/OR as a CAST or function argument anywhere, and as a window item, no longer
+  fail (#970)** — CUBRID rejects a bare `EXISTS (...)`, `NOT (...)` or `a AND b` / `a OR b` as
+  a CAST or function argument in every position, not only in the SELECT list and ORDER BY
+  (-493), and rejects a bare `EXISTS (...)` or `NOT (...)` as a window or `WITHIN GROUP`
+  `ORDER BY` / `PARTITION BY` item. A CAST or function now groups such an argument wherever it
+  appears, and those window items are grouped like ORDER BY items, so
+  `where(func.coalesce(and_(...), 0) == 1)`, `having(cast(and_(...), Integer) == 1)`, a join
+  `ON coalesce(...)`, `update().values(x=cast(and_(...), Integer))`,
+  `over(order_by=exists())`, `over(partition_by=exists())` and `within_group(~exists())` now
+  run. Bare `WHERE`/`HAVING`/`ON` conditions, `GROUP BY` items and `CASE` conditions render as
+  before. A CAST or function in `GROUP BY` now groups its argument too, but CUBRID still rejects
+  it ("search condition is not allowed as group by spec"). The `docs/FEATURE_SUPPORT.md` note
+  from #971 that listed these forms as unsupported is replaced.
+
 - **EXISTS and AND/OR inside a CAST, a function or ORDER BY no longer fail (#968)** — CUBRID
   also rejects a bare `EXISTS (...)`, `NOT (...)` or `a AND b` / `a OR b` as a CAST or
   function argument and as an ORDER BY item (-493). The compiler now groups such an expression

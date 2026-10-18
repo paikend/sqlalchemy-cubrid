@@ -168,7 +168,7 @@ class TestSelectCompilation:
 
 
 class TestBooleanSelectColumns:
-    """EXISTS, NOT and AND/OR as a SELECT-list item are grouped (#966).
+    """EXISTS, NOT and AND/OR as a SELECT-list item are grouped (#966, #968, #970).
 
     CUBRID rejects ``SELECT EXISTS (SELECT 1)``, ``SELECT NOT (...)`` and
     ``SELECT a AND b`` but accepts each inside parentheses.
@@ -344,19 +344,82 @@ class TestBooleanSelectColumns:
         [
             (
                 select(users.c.id).where(sa.func.coalesce(_and, 0) == 1),
-                "WHERE coalesce(users.name = 'a' AND users.id = 1, 0) = 1",
+                "WHERE coalesce((users.name = 'a' AND users.id = 1), 0) = 1",
+            ),
+            (
+                select(users.c.id).where(sa.cast(~_exists, Integer) == 1),
+                "WHERE CAST((NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))) AS INTEGER) = 1",
             ),
             (
                 select(sa.func.count()).select_from(users).having(sa.cast(_and, Integer) == 1),
-                "HAVING CAST(users.name = 'a' AND users.id = 1 AS INTEGER) = 1",
+                "HAVING CAST((users.name = 'a' AND users.id = 1) AS INTEGER) = 1",
             ),
+            (
+                select(users.c.id).select_from(
+                    users.join(users.alias("u"), sa.func.coalesce(_and, 0) == 1)
+                ),
+                "ON coalesce((users.name = 'a' AND users.id = 1), 0) = 1",
+            ),
+            (
+                sa.update(users).values(id=sa.cast(_and, Integer)),
+                "SET id=CAST((users.name = 'a' AND users.id = 1) AS INTEGER)",
+            ),
+            (
+                select(sa.func.row_number().over(order_by=_exists)),
+                "OVER (ORDER BY (EXISTS (SELECT * FROM users WHERE users.name = 'a')))",
+            ),
+            (
+                select(sa.func.row_number().over(order_by=~(users.c.id == 1))),
+                "OVER (ORDER BY users.id != 1)",
+            ),
+            (
+                select(sa.func.row_number().over(order_by=(~_exists).desc())),
+                "OVER (ORDER BY (NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))) DESC)",
+            ),
+            (
+                select(sa.func.row_number().over(partition_by=[_exists, users.c.id])),
+                "OVER (PARTITION BY (EXISTS (SELECT * FROM users WHERE users.name = 'a')), users.id)",
+            ),
+            (
+                select(sa.func.sum(users.c.id).over(order_by=sa.func.coalesce(_and, 0))),
+                "OVER (ORDER BY coalesce((users.name = 'a' AND users.id = 1), 0))",
+            ),
+            (
+                select(sa.func.percentile_cont(0.5).within_group(~_exists)),
+                "WITHIN GROUP (ORDER BY (NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))))",
+            ),
+            # CUBRID rejects a search condition as a GROUP BY item even in
+            # parentheses; the function groups its argument wherever it appears.
+            (
+                select(sa.func.count()).select_from(users).group_by(sa.func.coalesce(_exists, 0)),
+                "GROUP BY coalesce((EXISTS (SELECT * FROM users WHERE users.name = 'a')), 0)",
+            ),
+        ],
+        ids=[
+            "where-function",
+            "where-cast-not-exists",
+            "having-cast",
+            "on-function",
+            "update-set-cast",
+            "window-order-by-exists",
+            "window-order-by-negated-comparison",
+            "window-order-by-not-desc",
+            "window-partition-by-exists",
+            "window-order-by-function",
+            "within-group-not-exists",
+            "group-by-function",
+        ],
+    )
+    def test_grouped_outside_select_list(self, stmt, expected):
+        """A CAST or function argument anywhere, and window BY items, are grouped (#970)."""
+        assert expected in _norm(_compile(stmt))
+
+    @pytest.mark.parametrize(
+        ("stmt", "expected"),
+        [
             (
                 select(sa.func.count()).select_from(users).group_by(_and),
                 "GROUP BY users.name = 'a' AND users.id = 1",
-            ),
-            (
-                select(sa.func.count()).select_from(users).group_by(sa.func.coalesce(_exists, 0)),
-                "GROUP BY coalesce(EXISTS (SELECT * FROM users WHERE users.name = 'a'), 0)",
             ),
             (
                 select(users.c.id).order_by(sa.case((_and, 1), else_=0)),
@@ -366,52 +429,83 @@ class TestBooleanSelectColumns:
                 select(sa.func.coalesce(users.c.name == "a", False)),
                 "SELECT coalesce(users.name = 'a', 0)",
             ),
-            # Kept bare on purpose: a window ORDER BY is outside the #968 contract.
-            # CUBRID rejects this form (-493); it is documented as unsupported,
-            # with a case() workaround, and tracked in #970.
+            # SQLAlchemy splits an and_() given as a window ORDER BY into items.
             (
-                select(users.c.id).order_by(sa.func.row_number().over(order_by=_exists)),
-                "OVER (ORDER BY EXISTS (SELECT * FROM users WHERE users.name = 'a'))",
+                select(sa.func.row_number().over(order_by=_and)),
+                "OVER (ORDER BY users.name = 'a', users.id = 1)",
+            ),
+            (
+                select(sa.func.row_number().over(partition_by=users.c.name, order_by=users.c.id)),
+                "OVER (PARTITION BY users.name ORDER BY users.id)",
             ),
         ],
         ids=[
-            "where-function",
-            "having-cast",
             "group-by",
-            "group-by-function",
             "order-by-case",
             "comparison-argument",
-            "window-order-by",
+            "window-order-by-and-split",
+            "window-plain-items",
         ],
     )
     def test_wrapped_other_positions_are_unchanged(self, stmt, expected):
-        """Only SELECT columns and ORDER BY items are grouped through wrappers (#968)."""
+        """GROUP BY items, CASE conditions and non-boolean operands are not grouped."""
         assert expected in _norm(_compile(stmt))
 
-    def test_reused_expression_is_grouped_only_on_its_path(self):
-        """The same object in a window ORDER BY stays bare next to a grouped use (#968).
-
-        The bare window form is kept on purpose and is unsupported on CUBRID
-        (-493; documented with a case() workaround, tracked in #970). This test
-        pins that grouping one use does not leak into another.
-        """
+    def test_reused_expression_is_grouped_once_per_use(self):
+        """The same object is grouped once where it is an item or an argument (#968, #970)."""
         exists = sa.exists().where(users.c.name == "a")
         bare = "EXISTS (SELECT * FROM users WHERE users.name = 'a')"
         window = sa.func.row_number().over(order_by=exists)
         sql = _norm(_compile(select(users.c.id).order_by(sa.func.coalesce(exists, 0), window)))
-        assert sql.endswith(f"ORDER BY coalesce(({bare}), 0), row_number() OVER (ORDER BY {bare})")
-        sql = _norm(_compile(select(users.c.id).order_by(exists, window)))
-        assert sql.endswith(f"ORDER BY ({bare}), row_number() OVER (ORDER BY {bare})")
-        sql = _norm(_compile(select(sa.func.coalesce(exists, window).label("x"), window)))
-        assert sql.startswith(
-            f"SELECT coalesce(({bare}), row_number() OVER (ORDER BY {bare})) AS x, "
-            f"row_number() OVER (ORDER BY {bare}) AS anon_1"
+        assert sql.endswith(
+            f"ORDER BY coalesce(({bare}), 0), row_number() OVER (ORDER BY ({bare}))"
         )
+        sql = _norm(_compile(select(users.c.id).where(exists).order_by(exists, window)))
+        assert f"WHERE {bare} ORDER BY ({bare}), row_number() OVER (ORDER BY ({bare}))" in sql
+        sql = _norm(_compile(select(sa.func.max(exists).over(order_by=exists))))
+        assert sql.startswith(f"SELECT max(({bare})) OVER (ORDER BY ({bare})) AS anon_1")
         cast_ = sa.cast(exists, Integer)
         sql = _norm(_compile(select(users.c.id).order_by(cast_, sa.func.max(cast_).over())))
         assert sql.endswith(
-            f"ORDER BY CAST(({bare}) AS INTEGER), max(CAST({bare} AS INTEGER)) OVER ()"
+            f"ORDER BY CAST(({bare}) AS INTEGER), max(CAST(({bare}) AS INTEGER)) OVER ()"
         )
+
+
+class TestWindowItemsMatchSQLAlchemy:
+    """Window and WITHIN GROUP BY lists render one item at a time (#970).
+
+    For items that need no grouping, the output must equal SQLAlchemy's own
+    visit_clauselist, which renders those lists.
+    """
+
+    class _BaseListCompiler(CubridDialect.statement_compiler):
+        visit_clauselist = sa.sql.compiler.SQLCompiler.visit_clauselist
+
+    class _BaseListDialect(CubridDialect):
+        pass
+
+    _BaseListDialect.statement_compiler = _BaseListCompiler
+
+    @staticmethod
+    def _statements() -> list[Any]:
+        name = users.c.name
+        row_number = sa.func.row_number()
+        return [
+            select(row_number.over()),
+            select(row_number.over(order_by=users.c.id)),
+            select(row_number.over(partition_by=[name, users.c.id], order_by=users.c.id.desc())),
+            select(row_number.over(order_by=[name.asc().nulls_last(), sa.text("id DESC")])),
+            select(row_number.over(order_by=name == "a", rows=(None, 0))),
+            select(row_number.over(order_by=sa.case((name == "a", 1), else_=0))),
+            select(sa.func.sum(users.c.id).over(order_by=sa.func.coalesce(name, "x"))),
+            select(sa.func.percentile_cont(0.5).within_group(users.c.id.desc())),
+            select(users.c.id).where(sa.tuple_(users.c.id, name).in_([(1, "a")])),
+        ]
+
+    @pytest.mark.parametrize("index", range(9))
+    def test_plain_items_match_base_clauselist(self, index):
+        stmt = self._statements()[index]
+        assert _compile(stmt) == _compile(stmt, self._BaseListDialect())
 
 
 class TestOrderByClauseMatchesSQLAlchemy:
