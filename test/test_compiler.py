@@ -388,6 +388,14 @@ class TestBooleanSelectColumns:
                 select(sa.func.percentile_cont(0.5).within_group(~_exists)),
                 "WITHIN GROUP (ORDER BY (NOT (EXISTS (SELECT * FROM users WHERE users.name = 'a'))))",
             ),
+            (
+                select(sa.func.percentile_cont(0.5).within_group(_and)),
+                "WITHIN GROUP (ORDER BY (users.name = 'a' AND users.id = 1))",
+            ),
+            (
+                select(sa.func.row_number().over(order_by=[_and, users.c.id])),
+                "OVER (ORDER BY (users.name = 'a' AND users.id = 1), users.id)",
+            ),
             # CUBRID rejects a search condition as a GROUP BY item even in
             # parentheses; the function groups its argument wherever it appears.
             (
@@ -407,6 +415,8 @@ class TestBooleanSelectColumns:
             "window-partition-by-exists",
             "window-order-by-function",
             "within-group-not-exists",
+            "within-group-and",
+            "window-order-by-and-in-list",
             "group-by-function",
         ],
     )

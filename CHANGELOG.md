@@ -76,11 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- **Boolean expressions that still fail on CUBRID (#968)** — `docs/FEATURE_SUPPORT.md` now
-  states that `EXISTS (...)` and `a AND b` as a CAST or function argument in `WHERE`/`HAVING`
-  (`WHERE coalesce(a AND b, 0) = 1`, `WHERE CAST(a AND b AS INTEGER) = 1`) and as a window
-  `OVER (ORDER BY EXISTS (...))` item still fail with -493 on CUBRID 11.4. It gives a `case()`
-  workaround; grouping them is tracked in #970.
+- **Boolean expressions that still failed on CUBRID (#968)** — superseded by the #970 fix
+  above: those forms now run, and the `docs/FEATURE_SUPPORT.md` note that listed them, with its
+  `case()` workaround, is replaced. Do not use that workaround inside a window: CUBRID 11.4
+  evaluates a `CASE` (or `if()`) in a window `ORDER BY` or `PARTITION BY` as a constant, so the
+  window ignores it.
 
 - **The first-connection course has one page per lesson (#943)** — the rest of the course moves out of the Quick Start page into Lesson 3 (save a row and read it back through a separate connection, `save_row.py`), Lesson 4 (a transaction undone with `rollback()`, `rollback_row.py`, which shows the row count inside the transaction and can be rerun) and Lesson 5 (the owner- and comment-checked cleanup and removing the lab with `docker rm -f -v`), in English and Korean. The former single `first_saved_row.py` is split between Lessons 3 and 4; the table, its marker comment and the cleanup script are unchanged. The Quick Start page lists all five lessons, keeps the first-connection error table and next steps, and keeps its former "Step 3" and "Clean up" anchors as short "moved to" sections. Every command was rerun against `cubrid/cubrid:11.4` with the published SQLAlchemy 2.1.4, sqlalchemy-cubrid 1.11.0 and pycubrid 1.13.0, including reruns and the rollback before Lesson 3.
 
